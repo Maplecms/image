@@ -804,7 +804,7 @@ func cOffset(x, y, sratio string) string {
 func ycbcrToRGB(lhs, tmp string) string {
 	s := `
 		// This is an inline version of image/color/ycbcr.go's YCbCr.RGBA method.
-		$yy1 := int(src.Y[$i])<<16 + 1<<15
+		$yy1 := int(src.Y[$i]) * 0x10101
 		$cb1 := int(src.Cb[$j]) - 128
 		$cr1 := int(src.Cr[$j]) - 128
 		$r@ := ($yy1 + 91881*$cr1) >> 8
@@ -877,6 +877,13 @@ func relName(s string) string {
 const (
 	codeRoot = `
 		func (z $receiver) Scale(dst Image, dr image.Rectangle, src image.Image, sr image.Rectangle, op Op, opts *Options) {
+			// Try to simplify a Scale to a Copy when DstMask is not specified.
+			// If DstMask is not nil, Copy will call Scale back with same dr and sr, and cause stack overflow.
+			if dr.Size() == sr.Size() && (opts == nil || opts.DstMask == nil) {
+				Copy(dst, dr.Min, src, sr, op, opts)
+				return
+			}
+
 			var o Options
 			if opts != nil {
 				o = *opts
@@ -913,13 +920,23 @@ const (
 			}
 		}
 
-		func (z $receiver) Transform(dst Image, s2d *f64.Aff3, src image.Image, sr image.Rectangle, op Op, opts *Options) {
+		func (z $receiver) Transform(dst Image, s2d f64.Aff3, src image.Image, sr image.Rectangle, op Op, opts *Options) {
+			// Try to simplify a Transform to a Copy.
+			if s2d[0] == 1 && s2d[1] == 0 && s2d[3] == 0 && s2d[4] == 1 {
+				dx := int(s2d[2])
+				dy := int(s2d[5])
+				if float64(dx) == s2d[2] && float64(dy) == s2d[5] {
+					Copy(dst, image.Point{X: sr.Min.X + dx, Y: sr.Min.X + dy}, src, sr, op, opts)
+					return
+				}
+			}
+
 			var o Options
 			if opts != nil {
 				o = *opts
 			}
 
-			dr := transformRect(s2d, &sr)
+			dr := transformRect(&s2d, &sr)
 			// adr is the affected destination pixels.
 			adr := dst.Bounds().Intersect(dr)
 			adr, o.DstMask = clipAffectedDestRect(adr, o.DstMask, o.DstMaskP)
@@ -930,7 +947,7 @@ const (
 				op = Src
 			}
 
-			d2s := invert(s2d)
+			d2s := invert(&s2d)
 			// bias is a translation of the mapping from dst coordinates to src
 			// coordinates such that the latter temporarily have non-negative X
 			// and Y coordinates. This allows us to write int(f) instead of
@@ -1179,13 +1196,13 @@ const (
 			}
 		}
 
-		func (q *Kernel) Transform(dst Image, s2d *f64.Aff3, src image.Image, sr image.Rectangle, op Op, opts *Options) {
+		func (q *Kernel) Transform(dst Image, s2d f64.Aff3, src image.Image, sr image.Rectangle, op Op, opts *Options) {
 			var o Options
 			if opts != nil {
 				o = *opts
 			}
 
-			dr := transformRect(s2d, &sr)
+			dr := transformRect(&s2d, &sr)
 			// adr is the affected destination pixels.
 			adr := dst.Bounds().Intersect(dr)
 			adr, o.DstMask = clipAffectedDestRect(adr, o.DstMask, o.DstMaskP)
@@ -1195,7 +1212,7 @@ const (
 			if op == Over && o.SrcMask == nil && opaque(src) {
 				op = Src
 			}
-			d2s := invert(s2d)
+			d2s := invert(&s2d)
 			// bias is a translation of the mapping from dst coordinates to src
 			// coordinates such that the latter temporarily have non-negative X
 			// and Y coordinates. This allows us to write int(f) instead of

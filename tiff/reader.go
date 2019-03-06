@@ -35,12 +35,7 @@ func (e UnsupportedError) Error() string {
 	return "tiff: unsupported feature: " + string(e)
 }
 
-// An InternalError reports that an internal error was encountered.
-type InternalError string
-
-func (e InternalError) Error() string {
-	return "tiff: internal error: " + string(e)
-}
+var errNoPixels = FormatError("not enough pixel data")
 
 type decoder struct {
 	r         io.ReaderAt
@@ -115,9 +110,10 @@ func (d *decoder) ifdUint(p []byte) (u []uint, err error) {
 	return u, nil
 }
 
-// parseIFD decides whether the the IFD entry in p is "interesting" and
-// stows away the data in the decoder.
-func (d *decoder) parseIFD(p []byte) error {
+// parseIFD decides whether the IFD entry in p is "interesting" and
+// stows away the data in the decoder. It returns the tag number of the
+// entry and an error, if any.
+func (d *decoder) parseIFD(p []byte) (int, error) {
 	tag := d.byteOrder.Uint16(p[0:2])
 	switch tag {
 	case tBitsPerSample,
@@ -136,17 +132,17 @@ func (d *decoder) parseIFD(p []byte) error {
 		tImageWidth:
 		val, err := d.ifdUint(p)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		d.features[int(tag)] = val
 	case tColorMap:
 		val, err := d.ifdUint(p)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		numcolors := len(val) / 3
 		if len(val)%3 != 0 || numcolors <= 0 || numcolors > 256 {
-			return FormatError("bad ColorMap length")
+			return 0, FormatError("bad ColorMap length")
 		}
 		d.palette = make([]color.Color, numcolors)
 		for i := 0; i < numcolors; i++ {
@@ -164,15 +160,15 @@ func (d *decoder) parseIFD(p []byte) error {
 		// must terminate the import process gracefully.
 		val, err := d.ifdUint(p)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		for _, v := range val {
 			if v != 1 {
-				return UnsupportedError("sample format")
+				return 0, UnsupportedError("sample format")
 			}
 		}
 	}
-	return nil
+	return int(tag), nil
 }
 
 // readBits reads n bits from the internal buffer starting at the current offset.
@@ -216,14 +212,15 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 	// In this case, p contains the color difference to the preceding pixel.
 	// See page 64-65 of the spec.
 	if d.firstVal(tPredictor) == prHorizontal {
-		if d.bpp == 16 {
+		switch d.bpp {
+		case 16:
 			var off int
 			n := 2 * len(d.features[tBitsPerSample]) // bytes per sample times samples per pixel
 			for y := ymin; y < ymax; y++ {
 				off += n
 				for x := 0; x < (xmax-xmin-1)*n; x += 2 {
 					if off+2 > len(d.buf) {
-						return FormatError("not enough pixel data")
+						return errNoPixels
 					}
 					v0 := d.byteOrder.Uint16(d.buf[off-n : off-n+2])
 					v1 := d.byteOrder.Uint16(d.buf[off : off+2])
@@ -231,19 +228,21 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 					off += 2
 				}
 			}
-		} else if d.bpp == 8 {
+		case 8:
 			var off int
 			n := 1 * len(d.features[tBitsPerSample]) // bytes per sample times samples per pixel
 			for y := ymin; y < ymax; y++ {
 				off += n
 				for x := 0; x < (xmax-xmin-1)*n; x++ {
 					if off >= len(d.buf) {
-						return FormatError("not enough pixel data")
+						return errNoPixels
 					}
 					d.buf[off] += d.buf[off-n]
 					off++
 				}
 			}
+		case 1:
+			return UnsupportedError("horizontal predictor with 1 BitsPerSample")
 		}
 	}
 
@@ -256,7 +255,7 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 			for y := ymin; y < rMaxY; y++ {
 				for x := xmin; x < rMaxX; x++ {
 					if d.off+2 > len(d.buf) {
-						return FormatError("not enough pixel data")
+						return errNoPixels
 					}
 					v := d.byteOrder.Uint16(d.buf[d.off : d.off+2])
 					d.off += 2
@@ -264,6 +263,9 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 						v = 0xffff - v
 					}
 					img.SetGray16(x, y, color.Gray16{v})
+				}
+				if rMaxX == img.Bounds().Max.X {
+					d.off += 2 * (xmax - img.Bounds().Max.X)
 				}
 			}
 		} else {
@@ -273,7 +275,7 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 				for x := xmin; x < rMaxX; x++ {
 					v, ok := d.readBits(d.bpp)
 					if !ok {
-						return FormatError("not enough pixel data")
+						return errNoPixels
 					}
 					v = v * 0xff / max
 					if d.mode == mGrayInvert {
@@ -290,7 +292,7 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 			for x := xmin; x < rMaxX; x++ {
 				v, ok := d.readBits(d.bpp)
 				if !ok {
-					return FormatError("not enough pixel data")
+					return errNoPixels
 				}
 				img.SetColorIndex(x, y, uint8(v))
 			}
@@ -302,7 +304,7 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 			for y := ymin; y < rMaxY; y++ {
 				for x := xmin; x < rMaxX; x++ {
 					if d.off+6 > len(d.buf) {
-						return FormatError("not enough pixel data")
+						return errNoPixels
 					}
 					r := d.byteOrder.Uint16(d.buf[d.off+0 : d.off+2])
 					g := d.byteOrder.Uint16(d.buf[d.off+2 : d.off+4])
@@ -318,8 +320,8 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 				max := img.PixOffset(rMaxX, y)
 				off := (y - ymin) * (xmax - xmin) * 3
 				for i := min; i < max; i += 4 {
-					if d.off+3 > len(d.buf) {
-						return FormatError("not enough pixel data")
+					if off+3 > len(d.buf) {
+						return errNoPixels
 					}
 					img.Pix[i+0] = d.buf[off+0]
 					img.Pix[i+1] = d.buf[off+1]
@@ -335,7 +337,7 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 			for y := ymin; y < rMaxY; y++ {
 				for x := xmin; x < rMaxX; x++ {
 					if d.off+8 > len(d.buf) {
-						return FormatError("not enough pixel data")
+						return errNoPixels
 					}
 					r := d.byteOrder.Uint16(d.buf[d.off+0 : d.off+2])
 					g := d.byteOrder.Uint16(d.buf[d.off+2 : d.off+4])
@@ -352,7 +354,7 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 				max := img.PixOffset(rMaxX, y)
 				i0, i1 := (y-ymin)*(xmax-xmin)*4, (y-ymin+1)*(xmax-xmin)*4
 				if i1 > len(d.buf) {
-					return FormatError("not enough pixel data")
+					return errNoPixels
 				}
 				copy(img.Pix[min:max], d.buf[i0:i1])
 			}
@@ -363,7 +365,7 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 			for y := ymin; y < rMaxY; y++ {
 				for x := xmin; x < rMaxX; x++ {
 					if d.off+8 > len(d.buf) {
-						return FormatError("not enough pixel data")
+						return errNoPixels
 					}
 					r := d.byteOrder.Uint16(d.buf[d.off+0 : d.off+2])
 					g := d.byteOrder.Uint16(d.buf[d.off+2 : d.off+4])
@@ -380,7 +382,7 @@ func (d *decoder) decode(dst image.Image, xmin, ymin, xmax, ymax int) error {
 				max := img.PixOffset(rMaxX, y)
 				i0, i1 := (y-ymin)*(xmax-xmin)*4, (y-ymin+1)*(xmax-xmin)*4
 				if i1 > len(d.buf) {
-					return FormatError("not enough pixel data")
+					return errNoPixels
 				}
 				copy(img.Pix[min:max], d.buf[i0:i1])
 			}
@@ -423,10 +425,16 @@ func newDecoder(r io.Reader) (*decoder, error) {
 		return nil, err
 	}
 
+	prevTag := -1
 	for i := 0; i < len(p); i += ifdLen {
-		if err := d.parseIFD(p[i : i+ifdLen]); err != nil {
+		tag, err := d.parseIFD(p[i : i+ifdLen])
+		if err != nil {
 			return nil, err
 		}
+		if tag <= prevTag {
+			return nil, FormatError("tags are not sorted in ascending order")
+		}
+		prevTag = tag
 	}
 
 	d.config.Width = int(d.firstVal(tImageWidth))
@@ -436,6 +444,14 @@ func newDecoder(r io.Reader) (*decoder, error) {
 		return nil, FormatError("BitsPerSample tag missing")
 	}
 	d.bpp = d.firstVal(tBitsPerSample)
+	switch d.bpp {
+	case 0:
+		return nil, FormatError("BitsPerSample must not be 0")
+	case 1, 8, 16:
+		// Nothing to do, these are accepted by this implementation.
+	default:
+		return nil, UnsupportedError(fmt.Sprintf("BitsPerSample of %v", d.bpp))
+	}
 
 	// Determine the image mode.
 	switch d.firstVal(tPhotometricInterpretation) {
